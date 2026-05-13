@@ -1,0 +1,157 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: youracr.azurecr.io
+  IMAGE_NAME: affordmed-api
+  GO_VERSION: "1.22"
+
+jobs:
+  # ─── Lint & Test ─────────────────────────────────────────────────────────────
+  test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: affordmed_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Go ${{ env.GO_VERSION }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Install golangci-lint
+        run: curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(go env GOPATH)/bin v1.57.2
+
+      - name: Lint
+        run: golangci-lint run ./...
+
+      - name: Run unit tests
+        run: go test ./tests/unit/... -v -count=1
+
+      - name: Run integration tests
+        env:
+          INTEGRATION_TESTS: "true"
+          TEST_DB_URL: postgres://postgres:postgres@localhost:5432/affordmed_test?sslmode=disable
+          TEST_REDIS_URL: redis://localhost:6379/1
+        run: go test ./tests/integration/... -v -count=1
+
+      - name: Run E2E tests
+        env:
+          INTEGRATION_TESTS: "true"
+          TEST_DB_URL: postgres://postgres:postgres@localhost:5432/affordmed_test?sslmode=disable
+          TEST_REDIS_URL: redis://localhost:6379/2
+        run: go test ./tests/e2e/... -v -count=1
+
+      - name: Coverage report
+        run: |
+          go test ./... -coverprofile=coverage.out -covermode=atomic
+          go tool cover -func=coverage.out
+          COVERAGE=$(go tool cover -func=coverage.out | grep total | awk '{print $3}' | tr -d '%')
+          echo "Coverage: ${COVERAGE}%"
+          if (( $(echo "$COVERAGE < 80" | bc -l) )); then
+            echo "Coverage below 80%!"
+            exit 1
+          fi
+
+  # ─── Build & Push Docker Image ───────────────────────────────────────────────
+  build:
+    name: Build & Push Image
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Login to Azure Container Registry
+        uses: azure/docker-login@v1
+        with:
+          login-server: ${{ env.REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Set image tag
+        id: vars
+        run: echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./deployments/docker/Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.vars.outputs.sha_short }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          cache-to: type=inline
+
+  # ─── Deploy to AKS ───────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy to AKS
+    runs-on: ubuntu-latest
+    needs: build
+    environment: production
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Azure login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Set AKS context
+        uses: azure/aks-set-context@v3
+        with:
+          resource-group: ${{ secrets.AKS_RESOURCE_GROUP }}
+          cluster-name: ${{ secrets.AKS_CLUSTER_NAME }}
+
+      - name: Update image in deployment
+        run: |
+          SHA=$(git rev-parse --short HEAD)
+          kubectl set image deployment/affordmed-api \
+            api=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$SHA \
+            -n affordmed
+
+      - name: Wait for rollout
+        run: kubectl rollout status deployment/affordmed-api -n affordmed --timeout=120s
+
+      - name: Verify health endpoint
+        run: |
+          sleep 5
+          kubectl run health-check --rm --restart=Never --image=curlimages/curl \
+            -- curl -sf http://affordmed-api-svc.affordmed.svc.cluster.local/api/v1/health

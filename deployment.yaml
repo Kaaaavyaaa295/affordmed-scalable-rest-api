@@ -1,0 +1,156 @@
+# ─── Namespace ────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: affordmed
+
+---
+# ─── Secret (replace values with base64 encoded secrets) ─────────────────────
+apiVersion: v1
+kind: Secret
+metadata:
+  name: api-secrets
+  namespace: affordmed
+type: Opaque
+data:
+  # echo -n "your_value" | base64
+  DATABASE_URL: cG9zdGdyZXM6Ly91c2VyOnBhc3NAcG9zdGdyZXM6NTQzMi9hZmZvcmRtZWQ=
+  REDIS_URL: cmVkaXM6Ly9yZWRpcy16cXVldWU6NjM3OS8w
+  JWT_SECRET: Y2hhbmdlLW1lLXRvLWEtMzItY2hhci1zZWNyZXQtaW4tcHJvZA==
+
+---
+# ─── Deployment ───────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: affordmed-api
+  namespace: affordmed
+  labels:
+    app: affordmed-api
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: affordmed-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: affordmed-api
+    spec:
+      containers:
+        - name: api
+          image: youracr.azurecr.io/affordmed-api:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - secretRef:
+                name: api-secrets
+          env:
+            - name: GIN_MODE
+              value: release
+            - name: PORT
+              value: "8080"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+          livenessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+
+---
+# ─── Service ──────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: affordmed-api-svc
+  namespace: affordmed
+spec:
+  selector:
+    app: affordmed-api
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8080
+  type: ClusterIP
+
+---
+# ─── Horizontal Pod Autoscaler ────────────────────────────────────────────────
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: affordmed-api-hpa
+  namespace: affordmed
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: affordmed-api
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 65
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+
+---
+# ─── Ingress (Nginx) ──────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: affordmed-api-ingress
+  namespace: affordmed
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  tls:
+    - hosts:
+        - api.affordmed.com
+      secretName: affordmed-tls
+  rules:
+    - host: api.affordmed.com
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: affordmed-api-svc
+                port:
+                  number: 80
